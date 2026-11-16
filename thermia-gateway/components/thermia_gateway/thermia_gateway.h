@@ -1,4 +1,4 @@
-// thermia_gateway.h  v2026.10.20.5  ESP gateway-replacement component (header)
+// thermia_gateway.h  v2026.11.16.1  (16 Nov 2026 19:45)  ESP gateway-replacement component (header)
 #pragma once
 // Thermia / Danfoss DHP-AQ: ESP replacement for the Thermia Online gateway (0x0F).
 //
@@ -273,6 +273,25 @@ class ThermiaGateway : public Component, public uart::UARTDevice {
   uint32_t last_hp_update_ms_{0};
   bool hp_update_seen_{false};
   uint32_t mbx_req_{0}, mbx_served_{0}, mbx_dropped_{0};
+
+  // --- Receive-side diagnostics (log only; never change what is sent or when) ---
+  void log_unanswered_(const uint8_t *d, size_t n, const cm930::GatewayResponder::Reply &r);
+  void log_bad_frame_();
+  void stall_check_();
+  void note_fc10_(uint16_t start);
+  static bool rate_ok_(uint32_t &last_ms, uint32_t &suppressed);  // max 1 line per second
+  uint32_t unanswered_{0};             // frames to 0x0F left unanswered while armed (item 1)
+  uint32_t unanswered_since_fc10_{0};  // ... since the last decoded FC10 write
+  uint32_t idle_skips_{0};             // replies skipped by the idle_us < 1500 gate
+  uint32_t bad_logged_{0};             // bad frames whose bytes were captured
+  uint32_t rl_unanswered_ms_{0}, rl_unanswered_supp_{0};
+  uint32_t rl_idle_ms_{0}, rl_idle_supp_{0};
+  uint32_t rl_bad_ms_{0}, rl_bad_supp_{0};
+  uint32_t last_fc10_ms_{0};           // last FC10 write from the heat pump decoded
+  uint16_t last_fc10_start_{0};
+  uint32_t last_mbx_req_ms_{0};        // last mailbox poll seen while armed
+  bool stall_logged_{false};
+  static constexpr uint32_t STALL_MS = 10000;
   void auto_takeover_tick_();
   void publish_reg_(uint16_t reg, uint16_t value);
   void publish_sensors_(uint16_t reg, uint16_t value);  // push to the mapped sensor(s), if any

@@ -1,4 +1,4 @@
-// gateway_responder.h  v2026.10.20.5  gateway reply builder, two-pulse writes, resync
+// gateway_responder.h  v2026.11.16.1  (16 Nov 2026 19:45)  gateway reply builder, two-pulse writes, resync
 // Pure C++ (no ESPHome dependency) so it can be unit-tested on a PC.
 //
 // The ESP answers the heat pump AS the gateway. This header only BUILDS the exact reply
@@ -31,6 +31,17 @@ namespace cm930 {
 class GatewayResponder {
  public:
   enum class Kind : uint8_t { NONE, HANDSHAKE, ACK, READ, SUPPRESSED_UNSEEN, SUPPRESSED_BADREQ };
+  // Why no reply was built (diagnostics only; never affects what is sent).
+  enum class NoReply : uint8_t { NONE, NOT_FOR_US, UNSEEN_REG, BAD_REQUEST, UNSUPPORTED_FC };
+  static const char *no_reply_str(NoReply w) {
+    switch (w) {
+      case NoReply::NOT_FOR_US: return "not addressed to us";
+      case NoReply::UNSEEN_REG: return "unseen reg";
+      case NoReply::BAD_REQUEST: return "bad request";
+      case NoReply::UNSUPPORTED_FC: return "unsupported FC";
+      default: return "none";
+    }
+  }
 
   struct Reply {
     Kind kind{Kind::NONE};
@@ -38,6 +49,8 @@ class GatewayResponder {
     size_t len{0};
     uint16_t start{0}, qty{0};
     bool was_mailbox{false};
+    NoReply why_none{NoReply::NONE};  // set whenever len == 0
+    uint16_t first_unseen{0};         // first register not seen, when why_none == UNSEEN_REG
     bool has_reply() const { return len > 0; }
   };
 
@@ -84,11 +97,12 @@ class GatewayResponder {
   // not a request, or a read we must suppress under the only-valid-data rule).
   Reply build_reply(const uint8_t *d, size_t n) {
     Reply r;
-    if (n < 4 || d[0] != addr_) return r;
+    if (n < 4 || d[0] != addr_) { r.why_none = NoReply::NOT_FOR_US; return r; }
     const uint8_t fc = d[1];
     if (fc == 0x17) return build_handshake_(d, n);
     if (fc == 0x10) return build_ack_(d, n);
     if (fc == 0x03) return build_read_(d, n);
+    r.why_none = NoReply::UNSUPPORTED_FC;
     return r;  // any other function code: we do not answer
   }
 
@@ -225,10 +239,12 @@ class GatewayResponder {
 
   Reply build_handshake_(const uint8_t *d, size_t n) {
     Reply r;
+    r.why_none = NoReply::BAD_REQUEST;  // cleared below once a reply is built
     // request: addr fc rs(2) rq(2) ws(2) wq(2) bc=16 challenge(16) crc
     if (n < 13 || n != (size_t) d[10] + 13) return r;
     const uint16_t rq = rd_(d + 2), rqty = rd_(d + 4), wqty = rd_(d + 8);
     if (rqty != 8 || wqty != 8 || d[10] != 16) return r;  // not the canonical handshake
+    r.why_none = NoReply::NONE;
     (void) rq;
     uint8_t ans[16];
     handshake_response(d + 11, ans);
@@ -251,6 +267,9 @@ class GatewayResponder {
     const uint8_t bc = (n >= 7) ? d[6] : 0;
     if (n < 11 || bc != qty * 2 || n != (size_t) bc + 9 || qty == 0) {
       r.kind = Kind::SUPPRESSED_BADREQ;
+      r.why_none = NoReply::BAD_REQUEST;
+      r.start = (n >= 4) ? rd_(d + 2) : 0;
+      r.qty = qty;
       return r;
     }
     // ack = addr fc start qty + CRC  (= request[0..5])
@@ -266,12 +285,13 @@ class GatewayResponder {
 
   Reply build_read_(const uint8_t *d, size_t n) {
     Reply r;
-    if (n != 8) return r;  // a read request is exactly 8 bytes
+    if (n != 8) { r.why_none = NoReply::BAD_REQUEST; return r; }  // a read request is exactly 8 bytes
     const uint16_t start = rd_(d + 2), qty = rd_(d + 4);
     r.start = start;
     r.qty = qty;
     if (qty == 0 || qty > 125) {
       r.kind = Kind::SUPPRESSED_BADREQ;
+      r.why_none = NoReply::BAD_REQUEST;
       return r;
     }
     // Only-valid-data rule: every requested register must have been seen this session.
@@ -279,6 +299,8 @@ class GatewayResponder {
       const uint16_t reg = start + i;
       if (!(reg < STORE && seen_[reg])) {
         r.kind = Kind::SUPPRESSED_UNSEEN;
+        r.why_none = NoReply::UNSEEN_REG;
+        r.first_unseen = reg;
         reads_suppressed_++;
         return r;  // stay silent rather than invent a value
       }

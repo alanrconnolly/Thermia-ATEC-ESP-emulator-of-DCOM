@@ -1,3 +1,4 @@
+// modbus_rtu.h  v2026.11.16.1  (16 Nov 2026 19:45)  framing + decoders; bad-frame byte capture
 // Pure C++ (no ESPHome dependency) so it can be unit-tested on a PC.
 // Modbus-RTU framing + decoding of traffic addressed to the Thermia gateway (0x0F),
 // plus the heat pump's own FC23 I/O with its other bus devices (Fc23Decoder).
@@ -22,13 +23,25 @@ inline bool crc_ok(const uint8_t *d, size_t n) {
 }
 
 // Splits a raw byte stream into CRC-valid frames using idle gaps. Never transmits.
+// Every byte the framer throws away is also copied (first BAD_CAP bytes) into a "last bad"
+// buffer with a reason, so the caller can log it. Capture only; framing is unchanged.
 class Framer {
  public:
   static constexpr size_t MAX = 260;
+  static constexpr size_t BAD_CAP = 64;
+  enum class BadReason : uint8_t { NONE, IDLE_DROP, OVERFLOW, RESYNC_SKIP };
+  static const char *bad_reason_str(BadReason r) {
+    switch (r) {
+      case BadReason::IDLE_DROP: return "no valid CRC, dropped after idle";
+      case BadReason::OVERFLOW: return "buffer overflow";
+      case BadReason::RESYNC_SKIP: return "leading bytes skipped by resync";
+      default: return "none";
+    }
+  }
   explicit Framer(uint32_t gap_us = 3000, uint32_t drop_us = 30000) : gap_(gap_us), drop_(drop_us) {}
 
   void push(uint8_t b, uint32_t now_us) {
-    if (n_ >= MAX) { n_ = 0; bad_++; }
+    if (n_ >= MAX) { capture_bad_(buf_, n_, BadReason::OVERFLOW); n_ = 0; bad_++; }
     buf_[n_++] = b;
     last_ = now_us;
   }
@@ -41,8 +54,8 @@ class Framer {
     if (crc_ok(buf_, n_)) return emit_(0, data, len);
     // resync: we may have joined mid-frame, look for a valid frame at a later offset
     for (size_t k = 1; k + 8 <= n_; k++)
-      if (crc_ok(buf_ + k, n_ - k)) { bad_++; return emit_(k, data, len); }
-    if (idle >= drop_) { n_ = 0; bad_++; }  // give up on this garbage
+      if (crc_ok(buf_ + k, n_ - k)) { bad_++; capture_bad_(buf_, k, BadReason::RESYNC_SKIP); return emit_(k, data, len); }
+    if (idle >= drop_) { capture_bad_(buf_, n_, BadReason::IDLE_DROP); n_ = 0; bad_++; }  // give up on this garbage
     return false;
   }
 
@@ -52,7 +65,23 @@ class Framer {
   // quiet before transmitting anything.
   uint32_t idle_us(uint32_t now_us) const { return now_us - last_; }
 
+  // Last discarded bytes. bad_pending() stays true until clear_bad_pending(); a newer
+  // discard overwrites the buffer (bad() still counts every one).
+  bool bad_pending() const { return bad_pending_; }
+  void clear_bad_pending() { bad_pending_ = false; }
+  BadReason last_bad_reason() const { return bad_reason_; }
+  const uint8_t *last_bad_data() const { return bad_buf_; }
+  size_t last_bad_len() const { return bad_len_; }      // bytes captured (<= BAD_CAP)
+  size_t last_bad_total() const { return bad_total_; }  // bytes actually discarded
+
  private:
+  void capture_bad_(const uint8_t *src, size_t n, BadReason why) {
+    bad_total_ = n;
+    bad_len_ = n < BAD_CAP ? n : BAD_CAP;
+    memcpy(bad_buf_, src, bad_len_);
+    bad_reason_ = why;
+    bad_pending_ = true;
+  }
   bool emit_(size_t off, const uint8_t **data, size_t *len) {
     *data = buf_ + off;
     *len = n_ - off;
@@ -64,6 +93,10 @@ class Framer {
   size_t n_{0};
   uint32_t last_{0}, gap_, drop_;
   uint32_t ok_{0}, bad_{0};
+  uint8_t bad_buf_[BAD_CAP]{};
+  size_t bad_len_{0}, bad_total_{0};
+  BadReason bad_reason_{BadReason::NONE};
+  bool bad_pending_{false};
 };
 
 // Decodes frames for one slave address. Calls cb(register, value) for every register seen.

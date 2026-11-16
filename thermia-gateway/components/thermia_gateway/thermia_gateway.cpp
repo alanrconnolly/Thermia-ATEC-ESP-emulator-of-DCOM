@@ -1,4 +1,4 @@
-// thermia_gateway.cpp  v2026.10.20.5  ESP gateway-replacement component (impl)
+// thermia_gateway.cpp  v2026.11.16.1  (16 Nov 2026 19:45)  ESP gateway-replacement component (impl)
 #include <cmath>
 #include "thermia_gateway.h"
 #include "registers_json_handler.h"
@@ -70,12 +70,18 @@ void ThermiaGateway::setup() {
              (unsigned) this->shadow_.replies_checked(), (unsigned) this->shadow_.ok(),
              (unsigned) this->shadow_.ack_mismatch(), (unsigned) this->shadow_.read_change(),
              (unsigned) this->shadow_.mailbox_event(), (unsigned) this->shadow_.read_fail());
+    ESP_LOGI(TAG_AUDIT,
+             "diagnostics: unanswered=%u (log lines suppressed %u) | idle-gate skips=%u (suppressed %u) | "
+             "bad frames captured=%u (suppressed %u) | mailbox req=%u served=%u dropped=%u",
+             (unsigned) this->unanswered_, (unsigned) this->rl_unanswered_supp_, (unsigned) this->idle_skips_,
+             (unsigned) this->rl_idle_supp_, (unsigned) this->bad_logged_, (unsigned) this->rl_bad_supp_,
+             (unsigned) this->mbx_req_, (unsigned) this->mbx_served_, (unsigned) this->mbx_dropped_);
   });
+  this->set_interval("stall", 1000, [this]() { this->stall_check_(); });
 }
 
 void ThermiaGateway::loop() {
   uint8_t b;
-  uint32_t now = micros();
   this->responder_.tick(millis());  // expire any resync / write-flag hold by wall clock
   this->auto_takeover_tick_();
   if (this->web_base_ != nullptr) {
@@ -89,9 +95,13 @@ void ThermiaGateway::loop() {
     if (this->json_built_ms_ == 0 || millis() - this->json_built_ms_ >= JSON_REFRESH_MS)
       this->refresh_registers_json_();
   }
+  // Stamp each byte when it is actually read. (A single micros() taken at the top of loop()
+  // went stale whenever refresh_registers_json_() or other work ran first, so a frame could
+  // look as if it had ended long ago and be dropped part-way.)
   while (this->available()) {
-    if (this->read_byte(&b)) this->feed_byte_(b, now);
+    if (this->read_byte(&b)) this->feed_byte_(b, micros());
   }
+  if (this->framer_.bad_pending()) this->log_bad_frame_();
 
   if (this->store_.dump_active()) {
     std::string line;
@@ -106,6 +116,69 @@ void ThermiaGateway::loop() {
   const uint8_t *d;
   size_t n;
   if (this->framer_.poll(micros(), &d, &n)) this->handle_frame_(d, n);
+  if (this->framer_.bad_pending()) this->log_bad_frame_();  // poll() may have discarded bytes
+}
+
+// ---------------------------------------------------------------------------------------
+// Receive-side diagnostics. Log only: nothing here changes reply bytes, timing or arming.
+// ---------------------------------------------------------------------------------------
+bool ThermiaGateway::rate_ok_(uint32_t &last_ms, uint32_t &suppressed) {
+  const uint32_t now = millis();
+  if (last_ms != 0 && now - last_ms < 1000) {
+    suppressed++;
+    return false;
+  }
+  last_ms = now;
+  return true;
+}
+
+void ThermiaGateway::log_bad_frame_() {
+  this->framer_.clear_bad_pending();
+  this->bad_logged_++;
+  if (!rate_ok_(this->rl_bad_ms_, this->rl_bad_supp_)) return;
+  const size_t len = this->framer_.last_bad_len(), total = this->framer_.last_bad_total();
+  ESP_LOGW(TAG_AUDIT, "BAD FRAME (%s) len=%u%s: %s",
+           modbus_rtu::Framer::bad_reason_str(this->framer_.last_bad_reason()), (unsigned) total,
+           total > len ? str_sprintf(" (first %u shown)", (unsigned) len).c_str() : "",
+           format_hex_pretty(this->framer_.last_bad_data(), len).c_str());
+}
+
+void ThermiaGateway::log_unanswered_(const uint8_t *d, size_t n, const cm930::GatewayResponder::Reply &r) {
+  this->unanswered_++;
+  this->unanswered_since_fc10_++;
+  if (!rate_ok_(this->rl_unanswered_ms_, this->rl_unanswered_supp_)) return;
+  const uint16_t start = n >= 4 ? (uint16_t) ((d[2] << 8) | d[3]) : 0;
+  const uint16_t qty = n >= 6 ? (uint16_t) ((d[4] << 8) | d[5]) : 0;
+  std::string why = cm930::GatewayResponder::no_reply_str(r.why_none);
+  if (r.why_none == cm930::GatewayResponder::NoReply::UNSEEN_REG) why += str_sprintf(" %u", (unsigned) r.first_unseen);
+  ESP_LOGW(TAG_AUDIT, "UNANSWERED request FC%02X start=%u (0x%04X) qty=%u: %s, len=%u: %s", d[1], (unsigned) start,
+           (unsigned) start, (unsigned) qty, why.c_str(), (unsigned) n, format_hex_pretty(d, n).c_str());
+}
+
+void ThermiaGateway::note_fc10_(uint16_t start) {
+  const uint32_t now = millis();
+  if (this->stall_logged_) {
+    ESP_LOGW(TAG_AUDIT, "rotation resumed at 0x%04X (%u) after %u s", (unsigned) start, (unsigned) start,
+             (unsigned) ((now - this->last_fc10_ms_) / 1000));
+    this->stall_logged_ = false;
+  }
+  this->last_fc10_ms_ = now;
+  this->last_fc10_start_ = start;
+  this->unanswered_since_fc10_ = 0;
+}
+
+void ThermiaGateway::stall_check_() {
+  if (!this->armed_ || this->stall_logged_ || this->last_fc10_ms_ == 0) return;
+  const uint32_t now = millis();
+  if (now - this->last_fc10_ms_ < STALL_MS) return;
+  if (this->last_mbx_req_ms_ == 0 || now - this->last_mbx_req_ms_ > STALL_MS) return;  // polls stopped too
+  this->stall_logged_ = true;
+  ESP_LOGW(TAG_AUDIT,
+           "STALL: no FC10 write for %u s (last at 0x%04X/%u) but mailbox polls continue | mailbox served=%u "
+           "dropped=%u | FC03 req=%u | bad frames=%u | unanswered since last FC10=%u",
+           (unsigned) ((now - this->last_fc10_ms_) / 1000), (unsigned) this->last_fc10_start_,
+           (unsigned) this->last_fc10_start_, (unsigned) this->mbx_served_, (unsigned) this->mbx_dropped_,
+           (unsigned) this->a_r_req_, (unsigned) this->framer_.bad(), (unsigned) this->unanswered_since_fc10_);
 }
 
 void ThermiaGateway::feed_byte_(uint8_t b, uint32_t now_us) {
@@ -297,6 +370,7 @@ void ThermiaGateway::audit_(const uint8_t *d, size_t n) {
       gw_reply = true;
     } else if (n >= 11 && n == (size_t) d[6] + 9 && d[6] == qty * 2 && qty > 0) {
       this->a_w_ok_++;
+      this->note_fc10_((uint16_t) ((d[2] << 8) | d[3]));  // stall detector (log only)
       // Boot-push completion: a heat-pump boot push ends with the 1780 block. (A resync push
       // never includes 1780, so this only marks a real heat-pump boot.)
       uint16_t wstart = (uint16_t) ((d[2] << 8) | d[3]);
@@ -698,16 +772,28 @@ void ThermiaGateway::maybe_respond_(const uint8_t *d, size_t n) {
   const bool is_mbx_req = (d[1] == 0x03 && n == 8 &&
                            (uint16_t) ((d[2] << 8) | d[3]) == cm930::GatewayResponder::MAILBOX_START &&
                            (uint16_t) ((d[4] << 8) | d[5]) == cm930::GatewayResponder::MAILBOX_QTY);
-  if (is_mbx_req) this->mbx_req_++;
+  if (is_mbx_req) {
+    this->mbx_req_++;
+    this->last_mbx_req_ms_ = millis();
+  }
 
   auto reply = this->responder_.build_reply(d, n);
-  if (!reply.has_reply()) return;  // nothing to send (incl. an unseen read we suppress)
+  if (!reply.has_reply()) {  // nothing to send (incl. an unseen read we suppress)
+    this->log_unanswered_(d, n, reply);
+    return;
+  }
 
   // Final bus-idle gate: the request frame we just parsed was the last thing on the bus,
   // and the framer emitted it after a >=gap idle. Require the bus still idle right now.
   const uint32_t now_us = micros();
-  if (this->framer_.idle_us(now_us) < 1500) {  // someone is mid-frame; skip this one
+  const uint32_t idle = this->framer_.idle_us(now_us);
+  if (idle < 1500) {  // someone is mid-frame; skip this one
     if (is_mbx_req) this->mbx_dropped_++;
+    this->idle_skips_++;
+    if (rate_ok_(this->rl_idle_ms_, this->rl_idle_supp_))
+      ESP_LOGW(TAG_AUDIT, "reply SKIPPED by bus-idle gate (idle %u us < 1500) for FC%02X start=%u qty=%u, len=%u: %s",
+               (unsigned) idle, d[1], (unsigned) reply.start, (unsigned) reply.qty, (unsigned) n,
+               format_hex_pretty(d, n).c_str());
     return;
   }
 
